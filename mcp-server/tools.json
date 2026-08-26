@@ -1,0 +1,37 @@
+{
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Current weather for a city (canned demo data).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "city": { "type": "string", "description": "City name." }
+        },
+        "required": ["city"]
+      },
+      "annotations": {
+        "title": "Get current weather",
+        "readOnlyHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "get_forecast",
+      "description": "Multi-day forecast for a city (canned demo data).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "city": { "type": "string", "description": "City name." },
+          "days": { "type": "integer", "description": "Days ahead, 1-7. Default 3." }
+        },
+        "required": ["city"]
+      },
+      "annotations": {
+        "title": "Get forecast",
+        "readOnlyHint": true,
+        "idempotentHint": true
+      }
+    }
+  ]
+}
