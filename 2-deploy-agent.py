@@ -24,12 +24,20 @@ Usage:
     python 2-deploy-agent.py verify     # identity + gateway binding on the live agent
     python 2-deploy-agent.py teardown
 
+    # Step 6 (Gemini Enterprise) needs an ADK agent — see agent/agent.py:
+    python 2-deploy-agent.py deploy-adk            # from source, ~10 min
+    python 2-deploy-agent.py chat-adk "weather in Melbourne?"   # via :streamQuery, like Gemini Enterprise
+    python 2-deploy-agent.py teardown-adk
+
 Configuration comes from the environment (same variables as config.sh), plus:
-    MCP_URL   the dummy MCP server endpoint, e.g. https://<cloud-run-url>/mcp
+    MCP_URL             the dummy MCP server endpoint, e.g. https://<cloud-run-url>/mcp
+    AGENT_DISPLAY_NAME  which agent `verify` looks at (default gateway-demo-agent)
+    MODEL               Gemini model for the ADK agent (default gemini-2.5-flash)
 """
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -40,8 +48,15 @@ GATEWAY_ID = os.environ.get("GATEWAY_ID", "demo-egress-gw")
 STAGING_BUCKET = os.environ.get("STAGING_BUCKET", f"gs://{PROJECT_ID}-agent-staging")
 MCP_URL = os.environ.get("MCP_URL", "https://your-mcp-server.example.com/mcp")
 
-DISPLAY_NAME = "gateway-demo-agent"
+DISPLAY_NAME = os.environ.get("AGENT_DISPLAY_NAME", "gateway-demo-agent")
+ADK_DISPLAY_NAME = "gateway-demo-adk-agent"
+ADK_MODEL = os.environ.get("MODEL", "gemini-2.5-flash")
 DENIED_URL = "https://api.github.com/zen"  # deliberately NOT registered
+
+
+def _runtimes(client):
+    """google-cloud-aiplatform 2.x renamed client.agent_engines -> client.runtimes."""
+    return getattr(client, "runtimes", None) or client.agent_engines
 
 
 # ==============================================================================
@@ -93,7 +108,7 @@ def deploy():
     import agentplatform
 
     client = agentplatform.Client(project=PROJECT_ID, location=LOCATION)
-    remote = client.agent_engines.create(
+    remote = _runtimes(client).create(
         agent=GatewayDemoAgent(),
         config={
             "display_name": DISPLAY_NAME,
@@ -146,12 +161,12 @@ def _rest(url: str, body: dict | None = None) -> dict:
         return json.load(resp)
 
 
-def _agent_id() -> str:
+def _agent_id(display_name: str = DISPLAY_NAME) -> str:
     data = _rest(f"{BASE}?pageSize=100")
     for r in data.get("reasoningEngines", []):
-        if r.get("displayName") == DISPLAY_NAME:
+        if r.get("displayName") == display_name:
             return r["name"].split("/")[-1]
-    sys.exit(f"no agent named {DISPLAY_NAME}; run `deploy` first")
+    sys.exit(f"no agent named {display_name}; run `deploy` (or `deploy-adk`) first")
 
 
 def _invoke(agent_id: str, payload: dict) -> dict:
@@ -193,12 +208,108 @@ def verify():
 def teardown():
     import agentplatform
     client = agentplatform.Client(project=PROJECT_ID, location=LOCATION)
-    client.agent_engines.delete(
+    _runtimes(client).delete(
         name=f"projects/{PROJECT_ID}/locations/{LOCATION}/reasoningEngines/{_agent_id()}",
         force=True)
     print("deleted", DISPLAY_NAME)
 
 
+# ==============================================================================
+# The ADK agent (agent/agent.py) — needed for Gemini Enterprise, which drives
+# agents through :streamQuery. Deployed FROM SOURCE (no pickling): the SDK
+# tars the `agent` package and the platform builds the container. Same two
+# config entries as above, plus MCP_URL so the MCP toolset knows its server.
+# ==============================================================================
+def deploy_adk():
+    import agentplatform
+
+    # The SDK tars source_packages relative to the CWD, so run from the repo root.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    shutil.rmtree("agent/__pycache__", ignore_errors=True)
+    with open("agent/class_methods.json") as f:
+        class_methods = json.load(f)  # the AdkApp operations; source deploys must declare them
+
+    client = agentplatform.Client(project=PROJECT_ID, location=LOCATION)
+    remote = _runtimes(client).create(config={
+        "display_name": ADK_DISPLAY_NAME,
+        "description": "ADK weather agent governed by Agent Gateway",
+        "staging_bucket": STAGING_BUCKET,
+        "source_packages": ["agent"],
+        "entrypoint_module": "agent.agent_engine_app",   # root_agent wrapped in AdkApp
+        "entrypoint_object": "app",
+        "requirements_file": "agent/requirements.txt",
+        "agent_framework": "google-adk",
+        "class_methods": class_methods,
+        "env_vars": {"MCP_URL": MCP_URL, "MODEL": ADK_MODEL},
+        # ---- the same two entries as the trivial agent ----------------
+        "agent_gateway_config": {
+            "agent_to_anywhere_config": {
+                "agent_gateway": (
+                    f"projects/{PROJECT_ID}/locations/{LOCATION}"
+                    f"/agentGateways/{GATEWAY_ID}"
+                )
+            }
+        },
+        "identity_type": "AGENT_IDENTITY",
+        # --------------------------------------------------------------
+    })
+    name = remote.api_resource.name
+    print("\nDEPLOYED:", name)
+
+    # An LLM agent must be allowed to call Vertex AI. The trivial agent never
+    # needed this; an ADK agent running as its own Agent Identity does.
+    identity = _rest(f"{API}/{name}")["spec"]["effectiveIdentity"]
+    principal = f"principal://{identity}"
+    subprocess.run(["gcloud", "projects", "add-iam-policy-binding", PROJECT_ID,
+                    f"--member={principal}", "--role=roles/aiplatform.user",
+                    "--condition=None", "--quiet"], check=True, stdout=subprocess.DEVNULL)
+    print("granted roles/aiplatform.user to", principal)
+    print(f"\nNext: AGENT_DISPLAY_NAME={ADK_DISPLAY_NAME} ./3-register-mcp.sh grant"
+          "   (least-privilege grant for this agent)")
+
+
+def _stream_query(agent_id: str, text: str) -> str:
+    """The same call Gemini Enterprise makes: :streamQuery -> stream_query."""
+    req = urllib.request.Request(
+        f"{BASE}/{agent_id}:streamQuery",
+        data=json.dumps({"class_method": "stream_query",
+                         "input": {"user_id": "demo-user", "message": text}}).encode(),
+        headers={"Authorization": f"Bearer {_token()}",
+                 "Content-Type": "application/json"},
+    )
+    final = ""
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        for line in resp:  # newline-delimited JSON, one ADK event per line
+            line = line.strip()
+            if not line:
+                continue
+            ev = json.loads(line)
+            for part in (ev.get("content") or {}).get("parts", []):
+                if "functionCall" in part:
+                    print("  tool call:", json.dumps(part["functionCall"]))
+                if "text" in part:
+                    final = part["text"]
+    return final
+
+
+def chat_adk():
+    text = " ".join(sys.argv[2:]) or "What's the weather in Melbourne?"
+    agent_id = _agent_id(ADK_DISPLAY_NAME)
+    print(f"\n=== {ADK_DISPLAY_NAME} <- {text!r}")
+    print(_stream_query(agent_id, text).strip())
+    print("\nGateway verdicts:  ./1-setup-gateway.sh logs 15m")
+
+
+def teardown_adk():
+    import agentplatform
+    client = agentplatform.Client(project=PROJECT_ID, location=LOCATION)
+    _runtimes(client).delete(
+        name=f"projects/{PROJECT_ID}/locations/{LOCATION}/reasoningEngines/{_agent_id(ADK_DISPLAY_NAME)}",
+        force=True)
+    print("deleted", ADK_DISPLAY_NAME)
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "verify"
-    {"deploy": deploy, "demo": demo, "verify": verify, "teardown": teardown}[cmd]()
+    {"deploy": deploy, "demo": demo, "verify": verify, "teardown": teardown,
+     "deploy-adk": deploy_adk, "chat-adk": chat_adk, "teardown-adk": teardown_adk}[cmd]()

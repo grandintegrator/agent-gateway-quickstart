@@ -1,0 +1,10 @@
+project_id = "your-project-id"
+location   = "us-central1"
+gateway_id = "demo-egress-gw"
+
+# DRY_RUN first. Flip to ENFORCED once `1-setup-gateway.sh logs` shows no unexpected denials.
+enforcement_mode = "DRY_RUN"
+
+# Optional: register the agent in an existing Gemini Enterprise app.
+# gemini_enterprise_app_id = "my-app_1234567890"
+# publish_to_all_users     = true

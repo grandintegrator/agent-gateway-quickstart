@@ -1,0 +1,2 @@
+google-adk[mcp]>=2.8,<3
+google-cloud-aiplatform[agent_engines]>=2.1,<3

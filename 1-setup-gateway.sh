@@ -156,7 +156,11 @@ register_baseline() {
   _svc allow-telemetry-mtls    "Cloud Trace mTLS"      "https://telemetry.mtls.googleapis.com"
   _svc allow-logging           "Cloud Logging"         "https://logging.googleapis.com"
   _svc allow-logging-mtls      "Cloud Logging mTLS"    "https://logging.mtls.googleapis.com"
+  _svc allow-crm               "ResourceManager"       "https://cloudresourcemanager.googleapis.com"
   _svc allow-crm-mtls          "ResourceManager mTLS"  "https://cloudresourcemanager.mtls.googleapis.com"
+  # gRPC clients present host:443 and matching is exact — the ADK runtime's
+  # telemetry setup calls Resource Manager over gRPC at boot.
+  _svc allow-crm-mtls-grpc     "ResourceManager mTLS gRPC" "https://cloudresourcemanager.mtls.googleapis.com:443"
   _svc allow-iamcreds          "IAM Credentials"       "https://iamcredentials.googleapis.com"
   _svc allow-iamcreds-mtls     "IAM Credentials mTLS"  "https://iamcredentials.mtls.googleapis.com"
   echo "(registrations take ~4 min to propagate to the gateway)"
