@@ -21,3 +21,9 @@ export NS="https://networkservices.googleapis.com/v1"
 export AIP="https://${LOCATION}-aiplatform.googleapis.com/v1beta1"
 
 auth() { echo "Authorization: Bearer $(gcloud auth print-access-token)"; }
+
+# Gemini Enterprise (step 6). The app must already exist.
+: "${GE_APP_ID:=your-gemini-enterprise-app-id}"   # engine id, e.g. my-app_1234567890
+: "${GE_LOCATION:=global}"                        # global | us | eu
+: "${GE_PROJECT_NUMBER:=${PROJECT_NUMBER}}"       # project that owns the app
+export GE_APP_ID GE_LOCATION GE_PROJECT_NUMBER
