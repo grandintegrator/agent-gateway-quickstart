@@ -54,30 +54,76 @@ Python SDK or the Terraform provider.
 
 ### The request path, end to end
 
-After step 6, a question typed into Gemini Enterprise travels like this:
+After step 6, this is what exists and how it is wired. Solid arrows carry
+traffic, dotted arrows are the two policy inputs the gateway consults on every
+connection.
 
+```mermaid
+flowchart LR
+    subgraph GE["Gemini Enterprise app"]
+        U([Employee]) --> ASST["Default assistant<br/>agent registration"]
+    end
+    subgraph RT["Agent Runtime"]
+        AG["gateway-demo-adk-agent<br/>identity_type: AGENT_IDENTITY<br/>agent_gateway_config: demo-egress-gw"]
+    end
+    subgraph GW["Agent Gateway  (AGENT_TO_ANYWHERE)"]
+        P["IAP authz extension + policy<br/>DRY_RUN, then ENFORCED"]
+    end
+    REG[("Agent Registry (regional)<br/>baseline Google API hosts<br/>+ demo-weather-mcp with tools.json")]
+    IAM[("IAP IAM<br/>roles/iap.egressor<br/>per agent principal")]
+    MCP["demo-weather-mcp on Cloud Run<br/>get_weather / get_forecast"]
+    GAPI["*-aiplatform.mtls.googleapis.com<br/>Gemini, tracing, logging"]
+    GH["api.github.com<br/>not registered"]
+
+    ASST -- ":streamQuery" --> AG
+    AG -- "every outbound<br/>TLS connection" --> P
+    REG -. "gate 1: registered?" .-> P
+    IAM -. "gate 2: granted?" .-> P
+    P -- ALLOWED --> MCP
+    P -- ALLOWED --> GAPI
+    P -- "DENIED (403)" --> GH
+
+    classDef allowed fill:#e6f4ea,stroke:#1e8e3e,color:#137333
+    classDef denied fill:#fce8e6,stroke:#d93025,color:#a50e0e
+    classDef policy fill:#fef7e0,stroke:#f9ab00,color:#7a5c00
+    class MCP,GAPI allowed
+    class GH denied
+    class REG,IAM policy
 ```
-  employee in the           Discovery Engine              Agent Runtime
-  Gemini Enterprise app ──▶ assistant ─────────────────▶ gateway-demo-adk-agent   (:streamQuery)
-                            agent registration            identity_type  AGENT_IDENTITY
-                            GE service agent has          agent_gateway_config -> demo-egress-gw
-                            roles/aiplatform.user                 │
-                                                                  │  every outbound TLS connection
-                                                                  ▼
-                                                  ┌────────────────────────────────────┐
-                                                  │ Agent Gateway  (AGENT_TO_ANYWHERE) │
-                                                  │ IAP authz extension asks:          │
-                                                  │  1. is the host in Agent Registry? │
-                                                  │  2. does this principal hold       │
-                                                  │     roles/iap.egressor on it?      │
-                                                  └─────────────────┬──────────────────┘
-                                       both yes ◀───────────────────┴─────────────────▶ either no
-                                          │                                              │
-                                          ▼                                              ▼
-                          demo-weather-mcp (Cloud Run)                       api.github.com
-                          get_weather / get_forecast          ALLOWED        DENIED
-                          *-aiplatform.mtls.googleapis.com                   403 to the agent,
-                          (Gemini, tracing, logging)          ALLOWED        DENIED in the gateway log
+
+One question, two tool calls, two verdicts:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Employee
+    participant GE as Gemini Enterprise<br/>default assistant
+    participant RT as Agent Runtime<br/>gateway-demo-adk-agent
+    participant GW as Agent Gateway<br/>+ IAP authz
+    participant GM as Gemini API
+    participant MCP as demo-weather-mcp
+    participant GH as api.github.com
+
+    U->>GE: What is the weather in Melbourne?
+    GE->>RT: reasoningEngines:streamQuery<br/>(as the Discovery Engine service agent)
+    RT->>GW: TLS to us-central1-aiplatform.mtls.googleapis.com
+    Note over GW: baseline entry + registry-wide grant: ALLOWED
+    GW->>GM: generateContent
+    GM-->>RT: tool call get_weather(city=Melbourne)
+    RT->>GW: TLS to demo-weather-mcp-….run.app, MCP tools/call
+    Note over GW: registered with tools.json +<br/>iap.egressor for this principal: ALLOWED
+    GW->>MCP: tools/call get_weather
+    MCP-->>RT: 22 °C, sunny
+    RT-->>GE: answer
+    GE-->>U: It is 22 °C and sunny in Melbourne.
+
+    U->>GE: Fetch https://api.github.com/zen
+    GE->>RT: reasoningEngines:streamQuery
+    RT->>GW: TLS to api.github.com (fetch_url)
+    Note over GW: not in Agent Registry: DENIED<br/>(ENFORCED: blocked, DRY_RUN: logged as UNREGISTERED)
+    GW-->>RT: 403
+    RT-->>GE: fetch_url reports HTTP 403
+    GE-->>U: reports the denial
 ```
 
 Two identities are involved, and they are granted different things:
@@ -97,6 +143,30 @@ ever sees the agent. Passing user credentials through (an OAuth
 `authorizationConfig` on the registration) is out of scope for this repo, as
 are creating the Gemini Enterprise app itself, Private Service Connect egress
 on the gateway, and Model Armor.
+
+### Setup order
+
+The steps depend on each other as below. The Terraform module encodes the
+same edges as `depends_on`, which matters because the API does not: an agent
+created before the baseline allowlist exists fails to deploy about thirteen
+minutes later.
+
+```mermaid
+flowchart LR
+    S1["1  Gateway<br/>IAP authz (DRY_RUN)<br/>baseline allowlist<br/>broad grant"]
+    S2["2  Dummy MCP server<br/>on Cloud Run"]
+    S3["3  Agent on Agent Runtime<br/>AGENT_IDENTITY<br/>bound to the gateway"]
+    S4["4  Register the MCP server<br/>grant the agent"]
+    S5["5  Run the demo<br/>read the verdicts<br/>flip to ENFORCED"]
+    S6["6  ADK agent<br/>Gemini Enterprise registration<br/>(optional)"]
+
+    S1 --> S3
+    S2 --> S4
+    S1 --> S4
+    S3 --> S5
+    S4 --> S5
+    S5 --> S6
+```
 
 ### Two ways to build it
 
@@ -126,6 +196,34 @@ only when **both** hold:
 | Granted | `roles/iap.egressor` for the agent's identity | `gcloud beta iap web set-iam-policy` |
 
 Registration alone allows nothing; a grant alone allows nothing.
+
+```mermaid
+flowchart TD
+    S["Agent opens an outbound TLS connection<br/>gateway sees the hostname, and for MCP the request body"]
+    Q1{"Gate 1<br/>hostname in the regional Agent Registry?<br/>exact match, .mtls. and :443 forms count"}
+    Q2{"Gate 2<br/>agent principal holds roles/iap.egressor<br/>on that entry or the whole registry?<br/>for MCP, optionally per tool name"}
+    OK["ALLOWED"]
+    D1["DENIED  (UNREGISTERED)"]
+    D2["DENIED  (no grant)"]
+    M{"Enforcement mode"}
+    DRY["DRY_RUN: traffic flows,<br/>log shows the would-be denial"]
+    ENF["ENFORCED: 403 to the agent,<br/>DENIED in gateway_requests"]
+
+    S --> Q1
+    Q1 -- no --> D1
+    Q1 -- yes --> Q2
+    Q2 -- no --> D2
+    Q2 -- yes --> OK
+    D1 --> M
+    D2 --> M
+    M --> DRY
+    M --> ENF
+
+    classDef allowed fill:#e6f4ea,stroke:#1e8e3e,color:#137333
+    classDef denied fill:#fce8e6,stroke:#d93025,color:#a50e0e
+    class OK allowed
+    class D1,D2,ENF denied
+```
 
 The agent itself must run with `identity_type: AGENT_IDENTITY`, which gives it
 a SPIFFE-style principal — that principal is what the gateway authorizes:
