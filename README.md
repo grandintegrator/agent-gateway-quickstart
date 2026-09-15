@@ -1,17 +1,24 @@
 # Agent Gateway quickstart
 
-A minimal, end-to-end example of governing agent egress on Vertex AI Agent
-Engine with **Agent Gateway** and **Agent Identity**:
+A minimal, end-to-end example of the **govern** layer of **Gemini Enterprise
+Agent Platform (GEAP)**: an agent hosted on **Agent Runtime** runs with an
+**Agent Identity**, every outbound call it makes goes through an **Agent
+Gateway**, the gateway lets through only destinations that are in **Agent
+Registry** *and* granted to that identity, and the governed agent is handed to
+end users inside a **Gemini Enterprise** app.
+
+The path it sets up, in order:
 
 1. create an `AGENT_TO_ANYWHERE` gateway with IAP enforcement,
 2. deploy a dummy MCP server (canned weather data) to Cloud Run,
-3. deploy a tiny agent that runs with `AGENT_IDENTITY` and is bound to the
-   gateway,
-4. register the MCP server and grant the agent least-privilege access to it,
+3. deploy a tiny agent to Agent Runtime that runs with `AGENT_IDENTITY` and is
+   bound to the gateway,
+4. register the MCP server in Agent Registry and grant the agent
+   least-privilege access to it,
 5. watch the gateway log an **ALLOWED** verdict for the MCP call and a
    **DENIED** verdict for an unregistered API,
-6. (optional) deploy an ADK agent the same way and put it in a **Gemini
-   Enterprise** app, so end users get the governed agent in their UI.
+6. (optional) deploy an ADK agent the same way and register it in a **Gemini
+   Enterprise** app, so employees get the governed agent in their UI.
 
 Everything is also available as a single `terraform apply` — see
 [Terraform](#terraform).
@@ -23,7 +30,88 @@ Everything is also available as a single `terraform apply` — see
    └──────────────────────┘        └────────────────────────┘
 ```
 
-## How it works
+## What this sets up on Gemini Enterprise Agent Platform
+
+Gemini Enterprise Agent Platform is the evolution of Vertex AI. Its services
+fall into four groups — build, scale, govern, optimize — and the platform
+delivers agents to employees through the separate **Gemini Enterprise** app.
+This repo exercises the **govern** services end to end, on top of one
+**scale** service (Agent Runtime) and one **build** service (ADK), and
+finishes by putting the agent in Gemini Enterprise. Nothing here is a mock:
+every resource is the real GEAP one, created with `curl`, `gcloud`, the
+Python SDK or the Terraform provider.
+
+| GEAP component | What this repo does with it | Where |
+|----------------|-----------------------------|-------|
+| **Agent Development Kit (ADK)** | The agent Gemini Enterprise can talk to: an `LlmAgent` on Gemini with the weather MCP toolset and a `fetch_url` tool, wrapped in `AdkApp` | `agent/`, step 6 |
+| **Agent Runtime** (formerly Vertex AI Agent Engine; API resource `reasoningEngines`) | Hosts both agents. Two create-time settings make an agent governable: `identity_type: AGENT_IDENTITY` and `agent_gateway_config` | `2-deploy-agent.py`, `terraform/agent.tf`, steps 3 and 6 |
+| **Agent Identity** | Gives each agent a SPIFFE-style principal in the org's trust domain. That principal, not a service account, is what every gateway decision is made about | step 3, `TRUST_DOMAIN` in `config.sh` |
+| **Agent Gateway** | An `AGENT_TO_ANYWHERE` managed proxy in the agent's egress path. Default deny. Enforcement comes from an IAP authz extension and policy, first `DRY_RUN`, then `ENFORCED` | `1-setup-gateway.sh`, `terraform/gateway.tf`, `terraform/authz.tf`, steps 1 and 5 |
+| **Agent Registry** | The regional catalogue of destinations the gateway may reach: the Google APIs the runtime itself needs (baseline allowlist) and the MCP server, with its tool list for per-tool authorization | `1-setup-gateway.sh register_baseline`, `3-register-mcp.sh`, `terraform/registry.tf`, steps 1 and 4 |
+| **Identity-Aware Proxy (IAP)** | Holds the *grant* half of every decision: `roles/iap.egressor` for an agent principal on one registry entry or on the whole registry | `1-setup-gateway.sh grant_all`, `3-register-mcp.sh grant`, step 4 |
+| **Cloud Run** | Hosts the governed destination, a dummy MCP server with two tools | `mcp-server/`, step 2 |
+| **Gemini Enterprise** | The end-user surface. The ADK agent is registered under an existing app's default assistant (a Discovery Engine `assistants/*/agents` resource), first `PRIVATE`, then published to all users of the app | `4-register-gemini-enterprise.sh`, `terraform/gemini-enterprise.tf`, step 6 |
+
+### The request path, end to end
+
+After step 6, a question typed into Gemini Enterprise travels like this:
+
+```
+  employee in the           Discovery Engine              Agent Runtime
+  Gemini Enterprise app ──▶ assistant ─────────────────▶ gateway-demo-adk-agent   (:streamQuery)
+                            agent registration            identity_type  AGENT_IDENTITY
+                            GE service agent has          agent_gateway_config -> demo-egress-gw
+                            roles/aiplatform.user                 │
+                                                                  │  every outbound TLS connection
+                                                                  ▼
+                                                  ┌────────────────────────────────────┐
+                                                  │ Agent Gateway  (AGENT_TO_ANYWHERE) │
+                                                  │ IAP authz extension asks:          │
+                                                  │  1. is the host in Agent Registry? │
+                                                  │  2. does this principal hold       │
+                                                  │     roles/iap.egressor on it?      │
+                                                  └─────────────────┬──────────────────┘
+                                       both yes ◀───────────────────┴─────────────────▶ either no
+                                          │                                              │
+                                          ▼                                              ▼
+                          demo-weather-mcp (Cloud Run)                       api.github.com
+                          get_weather / get_forecast          ALLOWED        DENIED
+                          *-aiplatform.mtls.googleapis.com                   403 to the agent,
+                          (Gemini, tracing, logging)          ALLOWED        DENIED in the gateway log
+```
+
+Two identities are involved, and they are granted different things:
+
+- **Gemini Enterprise's service agent**
+  (`service-PROJECT_NUMBER@gcp-sa-discoveryengine.iam.gserviceaccount.com`)
+  gets `roles/aiplatform.user` and `roles/aiplatform.viewer` on the project so
+  the app may *invoke* the agent on Agent Runtime.
+- **The agent's Agent Identity principal** gets `roles/aiplatform.user` on the
+  project so it may call Gemini, and `roles/iap.egressor` on the registered
+  MCP server so it may get through the gateway. It gets nothing else, so a
+  destination that is not registered *and* granted stays unreachable no matter
+  what the model decides to call.
+
+The end user's own identity stops at Gemini Enterprise. The MCP server only
+ever sees the agent. Passing user credentials through (an OAuth
+`authorizationConfig` on the registration) is out of scope for this repo, as
+are creating the Gemini Enterprise app itself, Private Service Connect egress
+on the gateway, and Model Armor.
+
+### Two ways to build it
+
+| | Scripts (steps 1–6) | Terraform (`terraform/`) |
+|---|---|---|
+| Purpose | Teaching path: one resource at a time, inspect between steps | One `terraform apply`, one `terraform destroy` |
+| Agents | A trivial no-LLM agent (steps 3–5) plus the ADK agent (step 6) | The ADK agent only |
+| Gemini Enterprise | `4-register-gemini-enterprise.sh grant / register / publish` | Set `gemini_enterprise_app_id`; empty skips it |
+| Enforcement | `1-setup-gateway.sh enforce` flips `DRY_RUN` to `ENFORCED` | `enforcement_mode` variable, in-place update |
+| Resource names | `demo-egress-gw`, `allow-*`, `demo-weather-mcp` | The same, so a scripted stack can be `terraform import`ed |
+
+Both paths register into an **existing** Gemini Enterprise app. Neither
+creates one.
+
+## How the gateway decides
 
 Agent Gateway is a managed proxy in the network path of a deployed agent. It
 terminates and re-signs TLS, so it sees the hostname — and, for MCP only, the
@@ -53,11 +141,11 @@ principal://agents.global.org-ORG_ID.system.id.goog/resources/aiplatform/project
 | `config.sh` | Project / region / gateway settings shared by the shell scripts |
 | `1-setup-gateway.sh` | Gateway + IAP enforcement (DRY_RUN) + baseline allowlist + broad grant |
 | `mcp-server/` | The dummy MCP server (two tools, canned data) for Cloud Run |
-| `2-deploy-agent.py` | Deploys the demo agent with `AGENT_IDENTITY`, bound to the gateway (`deploy-adk` does the same for the ADK agent) |
-| `3-register-mcp.sh` | Registers the MCP server (with its tool list) and grants one agent access |
+| `2-deploy-agent.py` | Deploys the demo agent to Agent Runtime with `AGENT_IDENTITY`, bound to the gateway (`deploy-adk` does the same for the ADK agent) |
+| `3-register-mcp.sh` | Registers the MCP server in Agent Registry (with its tool list) and grants one agent access |
 | `agent/` | A small ADK agent (Gemini + the MCP toolset + a `fetch_url` tool) for step 6 and Terraform |
 | `4-register-gemini-enterprise.sh` | Registers the ADK agent in a Gemini Enterprise app, publishes it, asks it a question |
-| `terraform/` | The whole stack as one root module |
+| `terraform/` | The whole stack as one root module (see [`terraform/README.md`](terraform/README.md)) |
 
 ## Prerequisites
 
@@ -65,7 +153,9 @@ principal://agents.global.org-ORG_ID.system.id.goog/resources/aiplatform/project
   `networksecurity`, `iap`, `agentregistry`, `run`.
 - `gcloud` authenticated with permissions on all of the above.
 - Python 3.10+ with `pip install "google-cloud-aiplatform[agent_engines]"`.
-- A GCS staging bucket for Agent Engine deploys.
+- A GCS staging bucket for Agent Runtime deploys.
+- For step 6: an existing Gemini Enterprise app and a seat in it for whoever
+  runs the registration.
 
 ## Step 0 — configure
 
@@ -117,7 +207,7 @@ curl -sS -X POST "$(gcloud run services describe demo-weather-mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_weather","arguments":{"city":"Melbourne"}}}'
 ```
 
-## Step 3 — deploy the agent, with Agent Identity, bound to the gateway
+## Step 3 — deploy the agent to Agent Runtime, with Agent Identity, bound to the gateway
 
 ```bash
 source config.sh
@@ -173,7 +263,7 @@ unexpected:
 ./1-setup-gateway.sh enforce     # DRY_RUN -> ENFORCED: DENIED now means blocked
 ```
 
-## Step 6 — put the agent in Gemini Enterprise
+## Step 6 — put the agent in a Gemini Enterprise app
 
 Gemini Enterprise drives agents through `reasoningEngines:streamQuery`, which
 the trivial agent above does not implement. So this step deploys a second,
